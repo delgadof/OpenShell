@@ -449,10 +449,44 @@ pub struct TlsConfig {
     pub require_client_auth: bool,
 }
 
-/// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
+/// How the gateway validates an OIDC access token.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OidcTokenValidation {
+    /// Validate a JWT access token locally against the issuer's JWKS.
+    #[default]
+    Jwt,
+    /// Validate an opaque access token through the discovered `UserInfo` endpoint.
+    Userinfo,
+}
+
+impl fmt::Display for OidcTokenValidation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Jwt => f.write_str("jwt"),
+            Self::Userinfo => f.write_str("userinfo"),
+        }
+    }
+}
+
+impl FromStr for OidcTokenValidation {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "jwt" => Ok(Self::Jwt),
+            "userinfo" => Ok(Self::Userinfo),
+            _ => Err(format!(
+                "unsupported OIDC token validation mode '{value}'; expected jwt or userinfo"
+            )),
+        }
+    }
+}
+
+/// OIDC (`OpenID` Connect) configuration for access-token authentication.
 ///
-/// When configured, the server validates `authorization: Bearer <JWT>`
-/// headers on gRPC requests against the specified issuer's JWKS endpoint.
+/// When configured, the server validates `authorization: Bearer <access_token>`
+/// headers on gRPC requests using the selected validation strategy.
 ///
 /// The roles claim path is configurable to support different providers:
 /// - Keycloak: `realm_access.roles` (default)
@@ -467,9 +501,18 @@ pub struct OidcConfig {
     /// Expected audience (`aud`) claim. Typically the OIDC client ID.
     pub audience: String,
 
+    /// Access-token validation strategy. Defaults to local JWT validation.
+    #[serde(default)]
+    pub token_validation: OidcTokenValidation,
+
     /// JWKS cache TTL in seconds. Defaults to 3600 (1 hour).
     #[serde(default = "default_jwks_ttl_secs")]
     pub jwks_ttl_secs: u64,
+
+    /// Positive `UserInfo` result cache TTL in seconds. Only used when
+    /// `token_validation` is `userinfo`.
+    #[serde(default = "default_userinfo_cache_ttl_secs")]
+    pub userinfo_cache_ttl_secs: u64,
 
     /// Dot-separated path to the roles array in the JWT claims.
     /// Defaults to `realm_access.roles` (Keycloak).
@@ -517,6 +560,10 @@ pub struct GatewayAuthConfig {
 
 const fn default_jwks_ttl_secs() -> u64 {
     3600
+}
+
+const fn default_userinfo_cache_ttl_secs() -> u64 {
+    30
 }
 
 /// Gateway-minted sandbox JWT configuration.

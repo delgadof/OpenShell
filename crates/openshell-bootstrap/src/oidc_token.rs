@@ -16,7 +16,7 @@ use std::path::PathBuf;
 /// OIDC token bundle persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcTokenBundle {
-    /// `OAuth2` access token (JWT).
+    /// `OAuth2` access token.
     pub access_token: String,
 
     /// `OAuth2` refresh token. `None` for `client_credentials` grants.

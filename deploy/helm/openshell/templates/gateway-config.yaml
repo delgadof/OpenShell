@@ -92,20 +92,22 @@ data:
     {{- if .Values.server.oidc.issuer }}
 
     [openshell.gateway.oidc]
-    issuer        = {{ .Values.server.oidc.issuer | quote }}
-    audience      = {{ .Values.server.oidc.audience | quote }}
-    jwks_ttl_secs = {{ .Values.server.oidc.jwksTtl }}
-    {{- if .Values.server.oidc.rolesClaim }}
-    roles_claim   = {{ .Values.server.oidc.rolesClaim | quote }}
+    issuer                  = {{ .Values.server.oidc.issuer | quote }}
+    audience                = {{ .Values.server.oidc.audience | quote }}
+    token_validation        = {{ .Values.server.oidc.tokenValidation | quote }}
+    jwks_ttl_secs           = {{ .Values.server.oidc.jwksTtl }}
+    userinfo_cache_ttl_secs = {{ .Values.server.oidc.userinfoCacheTtl }}
+    {{- if or (eq .Values.server.oidc.tokenValidation "userinfo") .Values.server.oidc.rolesClaim }}
+    roles_claim             = {{ .Values.server.oidc.rolesClaim | quote }}
     {{- end }}
-    {{- if .Values.server.oidc.adminRole }}
-    admin_role    = {{ .Values.server.oidc.adminRole | quote }}
+    {{- if or (eq .Values.server.oidc.tokenValidation "userinfo") .Values.server.oidc.adminRole }}
+    admin_role              = {{ .Values.server.oidc.adminRole | quote }}
     {{- end }}
-    {{- if .Values.server.oidc.userRole }}
-    user_role     = {{ .Values.server.oidc.userRole | quote }}
+    {{- if or (eq .Values.server.oidc.tokenValidation "userinfo") .Values.server.oidc.userRole }}
+    user_role               = {{ .Values.server.oidc.userRole | quote }}
     {{- end }}
-    {{- if .Values.server.oidc.scopesClaim }}
-    scopes_claim  = {{ .Values.server.oidc.scopesClaim | quote }}
+    {{- if or (eq .Values.server.oidc.tokenValidation "userinfo") .Values.server.oidc.scopesClaim }}
+    scopes_claim            = {{ .Values.server.oidc.scopesClaim | quote }}
     {{- end }}
     {{- end }}
 

@@ -126,7 +126,7 @@ pub struct ServerState {
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 
-    /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
+    /// OIDC access-token validator state. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
     /// Gateway-minted sandbox JWT issuer. `None` when `config.gateway_jwt`
@@ -237,7 +237,11 @@ pub(crate) async fn run_server(
         let cache = auth::oidc::JwksCache::new(oidc)
             .await
             .map_err(|e| Error::config(format!("OIDC initialization failed: {e}")))?;
-        info!("OIDC JWT validation enabled (issuer: {})", oidc.issuer);
+        info!(
+            issuer = %oidc.issuer,
+            token_validation = %oidc.token_validation,
+            "OIDC access-token validation enabled"
+        );
         Some(Arc::new(cache))
     } else {
         None

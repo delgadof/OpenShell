@@ -127,9 +127,9 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_DISABLE_TLS")]
     disable_tls: bool,
 
-    /// OIDC issuer URL for JWT-based authentication.
-    /// When set, the server validates `authorization: Bearer` tokens on gRPC
-    /// requests against the issuer's JWKS endpoint.
+    /// OIDC issuer URL for access-token authentication.
+    /// When set, the server validates `authorization: Bearer` access tokens on
+    /// gRPC requests using the configured token-validation strategy.
     #[arg(long, env = "OPENSHELL_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
 
@@ -150,9 +150,17 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_OIDC_AUDIENCE", default_value = "openshell-cli")]
     oidc_audience: String,
 
+    /// OIDC access-token validation strategy: `jwt` or `userinfo`.
+    #[arg(long, env = "OPENSHELL_OIDC_TOKEN_VALIDATION", default_value_t)]
+    oidc_token_validation: openshell_core::OidcTokenValidation,
+
     /// JWKS key cache TTL in seconds.
     #[arg(long, env = "OPENSHELL_OIDC_JWKS_TTL", default_value_t = 3600)]
     oidc_jwks_ttl: u64,
+
+    /// Positive `UserInfo` validation cache TTL in seconds.
+    #[arg(long, env = "OPENSHELL_OIDC_USERINFO_CACHE_TTL", default_value_t = 30)]
+    oidc_userinfo_cache_ttl: u64,
 
     /// Dot-separated path to the roles array in the JWT claims.
     /// Keycloak: `realm_access.roles` (default). Entra ID: "roles". Okta: "groups".
@@ -397,7 +405,9 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
             audience: args.oidc_audience.clone(),
+            token_validation: args.oidc_token_validation,
             jwks_ttl_secs: args.oidc_jwks_ttl,
+            userinfo_cache_ttl_secs: args.oidc_userinfo_cache_ttl,
             roles_claim: args.oidc_roles_claim.clone(),
             admin_role: args.oidc_admin_role.clone(),
             user_role: args.oidc_user_role.clone(),
@@ -632,8 +642,14 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         if arg_defaulted(matches, "oidc_audience") {
             args.oidc_audience.clone_from(&oidc.audience);
         }
+        if arg_defaulted(matches, "oidc_token_validation") {
+            args.oidc_token_validation = oidc.token_validation;
+        }
         if arg_defaulted(matches, "oidc_jwks_ttl") {
             args.oidc_jwks_ttl = oidc.jwks_ttl_secs;
+        }
+        if arg_defaulted(matches, "oidc_userinfo_cache_ttl") {
+            args.oidc_userinfo_cache_ttl = oidc.userinfo_cache_ttl_secs;
         }
         if arg_defaulted(matches, "oidc_roles_claim") {
             args.oidc_roles_claim.clone_from(&oidc.roles_claim);
@@ -1367,6 +1383,8 @@ log_level = "debug"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _g1 = EnvVarGuard::remove("OPENSHELL_OIDC_ISSUER");
         let _g2 = EnvVarGuard::remove("OPENSHELL_OIDC_AUDIENCE");
+        let _g3 = EnvVarGuard::remove("OPENSHELL_OIDC_TOKEN_VALIDATION");
+        let _g4 = EnvVarGuard::remove("OPENSHELL_OIDC_USERINFO_CACHE_TTL");
 
         let (mut args, matches) =
             parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
@@ -1375,12 +1393,19 @@ log_level = "debug"
 [openshell.gateway.oidc]
 issuer = "https://idp.example.com"
 audience = "openshell-cli"
+token_validation = "userinfo"
+userinfo_cache_ttl_secs = 45
 "#,
         );
         merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
         assert_eq!(args.oidc_issuer.as_deref(), Some("https://idp.example.com"));
         assert_eq!(args.oidc_audience, "openshell-cli");
+        assert_eq!(
+            args.oidc_token_validation,
+            openshell_core::OidcTokenValidation::Userinfo
+        );
+        assert_eq!(args.oidc_userinfo_cache_ttl, 45);
     }
 
     #[test]

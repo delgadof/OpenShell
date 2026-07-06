@@ -211,7 +211,9 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.oidc.jwksTtl | int | `3600` | JWKS key cache TTL in seconds. |
 | server.oidc.rolesClaim | string | `""` | Dot-separated path to the roles array in the JWT claims. Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups". |
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
+| server.oidc.tokenValidation | string | `"jwt"` | Access-token validation strategy. Use "jwt" for local JWKS validation or "userinfo" for providers that issue opaque access tokens. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
+| server.oidc.userinfoCacheTtl | int | `30` | Positive UserInfo validation cache TTL in seconds. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into sandbox pods for dynamic provider token grants. |
 | server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into sandbox pods. |
 | server.sandboxImage | string | `"ghcr.io/nvidia/openshell-community/sandboxes/base:latest"` | Default sandbox image used when requests do not specify one. |

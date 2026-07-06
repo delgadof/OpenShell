@@ -164,10 +164,11 @@ impl SandboxJwtAuthenticator {
 
     #[allow(clippy::result_large_err)]
     fn validate_bearer(&self, token: &str) -> Result<Option<Principal>, Status> {
-        let header = decode_header(token).map_err(|e| {
-            debug!(error = %e, "sandbox JWT header decode failed");
-            Status::unauthenticated("invalid token")
-        })?;
+        let Ok(header) = decode_header(token) else {
+            // OIDC access tokens may be opaque. Only claim Bearer credentials
+            // that have a JWT header matching this gateway's sandbox key.
+            return Ok(None);
+        };
 
         // Fall through to other authenticators when the kid does not match —
         // OIDC issuers may share the Bearer slot.
@@ -351,13 +352,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_token_is_rejected() {
+    async fn non_jwt_bearer_falls_through() {
         let (_, auth) = pair();
-        let err = auth
-            .authenticate(&header_map_with_bearer("not.a.jwt"), "/anything")
+        let result = auth
+            .authenticate(&header_map_with_bearer("opaque-access-token"), "/anything")
             .await
-            .expect_err("malformed must reject");
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            .expect("opaque token classification must not fail");
+        assert!(result.is_none(), "opaque token must fall through");
     }
 
     #[tokio::test]

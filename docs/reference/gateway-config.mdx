@@ -44,7 +44,7 @@ version = 1
 # ... gateway listener TLS ...
 
 [openshell.gateway.oidc]
-# ... JWT bearer auth ...
+# ... OIDC access-token auth ...
 
 [openshell.drivers.kubernetes]
 # ... driver-specific settings ...
@@ -125,14 +125,20 @@ allow_unauthenticated_users = false
 enabled = false
 
 [openshell.gateway.oidc]
-issuer        = "https://idp.example.com/realms/openshell"
-audience      = "openshell-cli"
-jwks_ttl_secs = 3600
-roles_claim   = "realm_access.roles"
-admin_role    = "openshell-admin"
-user_role     = "openshell-user"
-scopes_claim  = ""
+issuer                  = "https://idp.example.com/realms/openshell"
+audience                = "openshell-cli"
+token_validation        = "jwt"
+jwks_ttl_secs           = 3600
+userinfo_cache_ttl_secs = 30
+roles_claim             = "realm_access.roles"
+admin_role              = "openshell-admin"
+user_role               = "openshell-user"
+scopes_claim            = ""
 ```
+
+`token_validation = "jwt"` validates JWT access tokens locally using the issuer's discovered JWKS. Set `token_validation = "userinfo"` for opaque access tokens; the gateway presents the token to the discovery document's `userinfo_endpoint` and accepts a JSON claims object or a signed JWT response. `userinfo_cache_ttl_secs` controls the positive identity cache and can be set to `0` to disable caching. UserInfo mode fails gateway startup when discovery does not publish a UserInfo endpoint.
+
+In UserInfo mode, set `roles_claim`, `admin_role`, `user_role`, and `scopes_claim` to empty strings for authentication-only deployments. In that mode, a valid identity may use authenticated methods without provider-specific OpenShell role or scope claims.
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
 

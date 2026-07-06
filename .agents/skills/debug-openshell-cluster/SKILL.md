@@ -206,6 +206,26 @@ helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage
 
 The gateway image built from `deploy/docker/Dockerfile.gateway` and the scratch supervisor image built from `deploy/docker/Dockerfile.supervisor` should use the same build tag in branch and E2E deploys. A stale supervisor image can make sandbox behavior lag behind gateway policy or proto changes.
 
+For OIDC failures, inspect the rendered validation strategy and authorization
+claims rather than relying only on Helm input values:
+
+```bash
+helm -n openshell get values openshell | grep -A12 'oidc:'
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -A10 '\[openshell.gateway.oidc\]'
+kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200 | grep -E 'OIDC|JWKS|UserInfo|token'
+```
+
+Use `token_validation = "jwt"` when the provider issues locally verifiable JWT
+access tokens. Use `token_validation = "userinfo"` when the provider issues
+opaque access tokens and its discovery document publishes `userinfo_endpoint`.
+UserInfo mode also renders `userinfo_cache_ttl_secs`; `0` disables the positive
+identity cache. For authentication-only UserInfo deployments, confirm
+`roles_claim`, `admin_role`, `user_role`, and `scopes_claim` are present as
+empty strings. If they are omitted, gateway defaults can re-enable role
+requirements. Startup fails when UserInfo mode is selected without a discovered
+UserInfo endpoint; 401 or 403 responses indicate token rejection, while
+transport and 5xx errors surface as validation unavailable.
+
 For local/external pull mode (the default local path via `mise run cluster`), local images are tagged to the configured local registry base, pushed to that registry, and pulled by k3s via the `registries.yaml` mirror endpoint. The `cluster` task pushes prebuilt local tags (`openshell/*:dev`, falling back to `localhost:5000/openshell/*:dev` or `127.0.0.1:5000/openshell/*:dev`).
 
 Gateway image builds stage a partial Rust workspace from `deploy/docker/Dockerfile.images`. If cargo fails with a missing manifest under `/build/crates/...`, or an imported symbol exists locally but is missing in the image build, verify that every current gateway dependency crate, including `openshell-driver-docker`, `openshell-driver-kubernetes`, and `openshell-ocsf`, is copied into the staged workspace there.

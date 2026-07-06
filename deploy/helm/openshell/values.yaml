@@ -268,7 +268,7 @@ server:
       enabled: false
       # -- Path to the SPIFFE Workload API socket mounted into sandbox pods.
       workloadApiSocketPath: /spiffe-workload-api/spire-agent.sock
-  # OIDC (OpenID Connect) configuration for JWT-based authentication.
+  # OIDC (OpenID Connect) configuration for access-token authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
   oidc:
     # -- OIDC issuer URL (e.g. https://keycloak.example.com/realms/openshell).
@@ -276,8 +276,13 @@ server:
     # -- Expected audience claim for the API resource server.
     # This should match the server's --oidc-audience, NOT the CLI client ID.
     audience: "openshell-cli"
+    # -- Access-token validation strategy. Use "jwt" for local JWKS validation
+    # or "userinfo" for providers that issue opaque access tokens.
+    tokenValidation: "jwt"
     # -- JWKS key cache TTL in seconds.
     jwksTtl: 3600
+    # -- Positive UserInfo validation cache TTL in seconds.
+    userinfoCacheTtl: 30
     # -- Dot-separated path to the roles array in the JWT claims.
     # Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups".
     rolesClaim: ""

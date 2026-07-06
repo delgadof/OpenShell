@@ -51,6 +51,14 @@ Supported auth modes:
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
 | OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
 
+OIDC clients always present the provider's OAuth access token. The gateway can
+validate JWT access tokens locally against the issuer's discovered JWKS, or it
+can validate opaque access tokens through the issuer's discovered UserInfo
+endpoint. UserInfo may return JSON claims or a signed JWT; signed responses use
+the same local issuer, audience, expiration, and JWKS checks. This strategy is
+an operator-selected issuer capability, so the CLI and stored token format do
+not vary by provider.
+
 Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
 does not grant sandbox identity. Kubernetes deployments use the
 gateway-minted JWT bootstrap path: the supervisor starts with a projected

@@ -159,6 +159,77 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.auth\].*?allow_unauthenticated_users\s*=\s*true'
 
+  - it: renders UserInfo validation for opaque OIDC access tokens
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.tokenValidation: userinfo
+      server.oidc.userinfoCacheTtl: 45
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'token_validation\s*=\s*"userinfo"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'userinfo_cache_ttl_secs\s*=\s*45'
+
+  - it: allows the UserInfo identity cache to be disabled
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.tokenValidation: userinfo
+      server.oidc.userinfoCacheTtl: 0
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'userinfo_cache_ttl_secs\s*=\s*0'
+
+  - it: renders empty OIDC authorization claims for UserInfo mode
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.tokenValidation: userinfo
+      server.oidc.rolesClaim: ""
+      server.oidc.adminRole: ""
+      server.oidc.userRole: ""
+      server.oidc.scopesClaim: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'roles_claim\s*=\s*""'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'admin_role\s*=\s*""'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'user_role\s*=\s*""'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'scopes_claim\s*=\s*""'
+
+  - it: preserves omitted empty OIDC authorization claims for JWT mode
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.tokenValidation: jwt
+      server.oidc.rolesClaim: ""
+      server.oidc.adminRole: ""
+      server.oidc.userRole: ""
+      server.oidc.scopesClaim: ""
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'roles_claim\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'admin_role\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'user_role\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'scopes_claim\s*='
+
   - it: omits the gRPC rate limit by default
     template: templates/gateway-config.yaml
     asserts:

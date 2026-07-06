@@ -11,7 +11,7 @@
 ///
 /// Produced by an authentication provider and consumed by the authorization
 /// layer. The gateway's auth middleware converts provider-specific claims
-/// (OIDC JWT, mTLS cert CN, etc.) into this common representation.
+/// (OIDC access token, mTLS cert CN, etc.) into this common representation.
 #[derive(Debug, Clone)]
 pub struct Identity {
     /// Unique subject identifier (OIDC `sub`, cert CN, username, etc.).
@@ -33,7 +33,7 @@ pub struct Identity {
 /// Authentication provider that produced an identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityProvider {
-    /// OIDC/OAuth2 JWT bearer token.
+    /// OIDC/OAuth2 access token.
     Oidc,
     /// mTLS client certificate.
     Mtls,

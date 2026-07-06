@@ -79,13 +79,22 @@ openshell-gateway \
   --oidc-user-role openshell-user
 ```
 
+OpenShell supports two access-token validation strategies:
+
+- `jwt` (default) validates a JWT access token locally using the issuer, audience, expiration, key ID, and discovered JWKS.
+- `userinfo` validates an opaque access token by sending it as a Bearer token to the issuer's discovered `userinfo_endpoint`. The endpoint may return a standard JSON claims object or a signed JWT. Signed JWT responses are validated with the same issuer, audience, expiration, key ID, and JWKS checks as JWT access tokens.
+
+UserInfo validation caches successful identities for a short configurable period. Cache keys are SHA-256 token hashes; raw access tokens are not used as cache keys. Rejected tokens are not cached. UserInfo requests do not follow redirects, preventing the bearer token from being forwarded to another endpoint. Provider transport failures fail closed with an unavailable response rather than authenticating the request.
+
 The same settings are available through environment variables:
 
 | Environment variable | Purpose | Default |
 |---|---|---|
 | `OPENSHELL_OIDC_ISSUER` | OIDC issuer URL. The gateway discovers `/.well-known/openid-configuration` from this URL. | None |
 | `OPENSHELL_OIDC_AUDIENCE` | Expected JWT `aud` claim. | `openshell-cli` |
+| `OPENSHELL_OIDC_TOKEN_VALIDATION` | Access-token validation strategy: `jwt` or `userinfo`. | `jwt` |
 | `OPENSHELL_OIDC_JWKS_TTL` | JWKS cache TTL in seconds. The gateway also refreshes on an unknown key ID. | `3600` |
+| `OPENSHELL_OIDC_USERINFO_CACHE_TTL` | Positive UserInfo identity cache TTL in seconds. Set to `0` to disable caching. | `30` |
 | `OPENSHELL_OIDC_ROLES_CLAIM` | Dot-separated claim path containing roles. | `realm_access.roles` |
 | `OPENSHELL_OIDC_ADMIN_ROLE` | Role required for admin operations. | `openshell-admin` |
 | `OPENSHELL_OIDC_USER_ROLE` | Role required for standard user operations. | `openshell-user` |
@@ -98,9 +107,25 @@ server:
   oidc:
     issuer: https://idp.example.com/realms/openshell
     audience: openshell-cli
+    tokenValidation: jwt
     rolesClaim: realm_access.roles
     adminRole: openshell-admin
     userRole: openshell-user
+    scopesClaim: ""
+```
+
+For an issuer that returns opaque access tokens and exposes UserInfo, select `userinfo`. This example enables authentication-only mode because the issuer does not provide OpenShell-specific roles or scopes:
+
+```yaml
+server:
+  oidc:
+    issuer: https://issuer.example.com/oidc
+    audience: openshell-cli
+    tokenValidation: userinfo
+    userinfoCacheTtl: 30
+    rolesClaim: ""
+    adminRole: ""
+    userRole: ""
     scopesClaim: ""
 ```
 
@@ -120,12 +145,14 @@ The connection flow:
 
 1. The CLI loads the stored OIDC token bundle.
 2. If the access token is expired and a refresh token is available, the CLI refreshes it.
-3. The CLI connects to the gateway and attaches `authorization: Bearer <token>` metadata to each gRPC request.
-4. The gateway validates the JWT signature, issuer, audience, expiration, and key ID against the issuer's JWKS.
+3. The CLI connects to the gateway and attaches `authorization: Bearer <access_token>` metadata to each gRPC request.
+4. In `jwt` mode, the gateway validates the access token locally against the issuer's JWKS. In `userinfo` mode, it presents the opaque access token to the discovered UserInfo endpoint and validates the returned JSON claims or signed JWT.
 5. The gateway extracts roles and optional scopes from the configured claim paths.
 6. The gateway authorizes the gRPC method. Admin methods require the admin role, other authenticated methods require the user role. Admin role holders also satisfy user-role checks.
 
 If `OPENSHELL_OIDC_SCOPES_CLAIM` is set, the gateway also enforces scopes. It accepts space-delimited scope strings such as `scope: "openid sandbox:read"` and JSON arrays such as `scp: ["sandbox:read"]`. Standard OIDC scopes such as `openid`, `profile`, `email`, and `offline_access` are ignored for authorization. `openshell:all` grants access to all scoped methods.
+
+The gateway always uses the OAuth `access_token` as the API credential. It does not substitute the OIDC `id_token`, which identifies the login session and is intended for the OIDC client rather than as a general API bearer token.
 
 Supervisor-to-gateway RPCs do not use user OIDC tokens or mTLS user identity. Each sandbox supervisor presents a gateway-minted `Authorization: Bearer` token scoped to its sandbox ID. On Kubernetes, the gateway mints that token only after TokenReview validates the projected ServiceAccount token, the pod UID matches the live pod, and the pod's controlling `Sandbox` ownerReference matches the live Sandbox CR. Log upload, policy status, credential environment lookup, inference bundle lookup, and sandbox config sync run with sandbox-restricted scope, while CLI users authenticate with OIDC, edge auth, local mTLS user authentication, or an explicitly enabled unauthenticated local developer mode. `GetInferenceBundle` returns route material that includes provider credentials, so it requires a sandbox principal; user callers manage inference configuration through the user-facing inference APIs instead.
 

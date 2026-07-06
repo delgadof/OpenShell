@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OIDC JWT authentication provider.
+//! OIDC access-token authentication provider.
 //!
-//! Validates `authorization: Bearer <JWT>` headers against a Keycloak (or
-//! any OIDC-compliant) issuer using cached JWKS keys. Produces an
-//! `Identity` that the authorization layer (`authz.rs`) evaluates.
+//! Validates `authorization: Bearer <access_token>` headers either locally
+//! against cached issuer JWKS keys or through the issuer's discovered
+//! `UserInfo` endpoint. Produces an `Identity` that the authorization layer
+//! (`authz.rs`) evaluates.
 //!
 //! This module owns authentication (verifying who the caller is).
 //! Authorization (deciding what the caller can do) is in `authz.rs`.
@@ -15,9 +16,10 @@ use super::identity::{Identity, IdentityProvider};
 use super::principal::{Principal, UserPrincipal};
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
-use openshell_core::OidcConfig;
+use openshell_core::{OidcConfig, OidcTokenValidation};
 use reqwest::Client;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,7 +56,16 @@ pub struct JwksCache {
     /// into a single HTTP fetch rather than stampeding the OIDC provider.
     refresh_mutex: tokio::sync::Mutex<()>,
     http: Client,
+    userinfo_http: Client,
     config: OidcConfig,
+    userinfo_endpoint: Option<String>,
+    userinfo_cache: Arc<RwLock<HashMap<[u8; 32], CachedIdentity>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedIdentity {
+    identity: Identity,
+    expires_at: Instant,
 }
 
 impl std::fmt::Debug for JwksCache {
@@ -71,6 +82,8 @@ impl std::fmt::Debug for JwksCache {
 struct OidcDiscovery {
     issuer: String,
     jwks_uri: String,
+    #[serde(default)]
+    userinfo_endpoint: Option<String>,
 }
 
 /// JWKS key set.
@@ -172,6 +185,11 @@ impl JwksCache {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+        let userinfo_http = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("failed to create UserInfo HTTP client: {e}"))?;
 
         // Discover JWKS URI from the OIDC discovery endpoint.
         let discovery_url = format!(
@@ -198,6 +216,15 @@ impl JwksCache {
             ));
         }
 
+        if config.token_validation == OidcTokenValidation::Userinfo
+            && discovery.userinfo_endpoint.is_none()
+        {
+            return Err(
+                "OIDC discovery document has no userinfo_endpoint required for userinfo token validation"
+                    .to_string(),
+            );
+        }
+
         info!(jwks_uri = %discovery.jwks_uri, "OIDC JWKS URI discovered");
 
         let cache = Self {
@@ -211,7 +238,10 @@ impl JwksCache {
             )),
             refresh_mutex: tokio::sync::Mutex::new(()),
             http,
+            userinfo_http,
             config: config.clone(),
+            userinfo_endpoint: discovery.userinfo_endpoint,
+            userinfo_cache: Arc::new(RwLock::new(HashMap::new())),
         };
 
         cache.refresh_keys().await?;
@@ -281,11 +311,19 @@ impl JwksCache {
         self.refresh_keys().await
     }
 
+    /// Validate an access token using the configured strategy.
+    pub async fn validate_access_token(&self, token: &str) -> Result<Identity, Status> {
+        match self.config.token_validation {
+            OidcTokenValidation::Jwt => self.validate_jwt(token).await,
+            OidcTokenValidation::Userinfo => self.validate_through_userinfo(token).await,
+        }
+    }
+
     /// Validate a JWT and return an `Identity`.
     ///
     /// This is the authentication step — it verifies the caller's identity
     /// but does not check authorization (that's `authz::AuthzPolicy::check`).
-    pub async fn validate_token(&self, token: &str) -> Result<Identity, Status> {
+    async fn validate_jwt(&self, token: &str) -> Result<Identity, Status> {
         self.refresh_if_stale().await.map_err(|e| {
             warn!(error = %e, "JWKS refresh failed");
             Status::internal("OIDC key refresh failed")
@@ -330,8 +368,13 @@ impl JwksCache {
             Status::unauthenticated(format!("invalid token: {e}"))
         })?;
 
-        let mut claims = token_data.claims;
-        claims.extract_roles(&self.config.roles_claim);
+        Ok(self.identity_from_claims(token_data.claims))
+    }
+
+    fn identity_from_claims(&self, mut claims: OidcClaims) -> Identity {
+        if !self.config.roles_claim.is_empty() {
+            claims.extract_roles(&self.config.roles_claim);
+        }
 
         let scopes = if self.config.scopes_claim.is_empty() {
             vec![]
@@ -339,18 +382,109 @@ impl JwksCache {
             claims.extract_scopes(&self.config.scopes_claim)
         };
 
-        Ok(Identity {
+        Identity {
             subject: claims.sub,
             display_name: claims.preferred_username,
             roles: claims.roles,
             scopes,
             provider: IdentityProvider::Oidc,
-        })
+        }
+    }
+
+    async fn validate_through_userinfo(&self, token: &str) -> Result<Identity, Status> {
+        let cache_key = token_cache_key(token);
+        let now = Instant::now();
+        if let Some(cached) = self
+            .userinfo_cache
+            .read()
+            .await
+            .get(&cache_key)
+            .filter(|cached| cached.expires_at > now)
+        {
+            return Ok(cached.identity.clone());
+        }
+
+        let endpoint = self
+            .userinfo_endpoint
+            .as_deref()
+            .ok_or_else(|| Status::internal("OIDC UserInfo endpoint is not configured"))?;
+        let response = self
+            .userinfo_http
+            .get(endpoint)
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "application/json, application/jwt")
+            .send()
+            .await
+            .map_err(|error| {
+                warn!(%error, "OIDC UserInfo request failed");
+                Status::unavailable("OIDC UserInfo validation unavailable")
+            })?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            debug!(%status, "OIDC UserInfo rejected access token");
+            return Err(Status::unauthenticated("invalid token"));
+        }
+        if !status.is_success() {
+            warn!(%status, "OIDC UserInfo returned an unexpected status");
+            return Err(Status::unavailable("OIDC UserInfo validation unavailable"));
+        }
+
+        let body = response.text().await.map_err(|error| {
+            warn!(%error, "failed to read OIDC UserInfo response");
+            Status::unavailable("OIDC UserInfo response invalid")
+        })?;
+        let identity = self.identity_from_userinfo_response(&body).await?;
+
+        let cache_ttl = Duration::from_secs(self.config.userinfo_cache_ttl_secs);
+        if !cache_ttl.is_zero() {
+            let expires_at = Instant::now()
+                .checked_add(cache_ttl)
+                .unwrap_or_else(Instant::now);
+            let mut cache = self.userinfo_cache.write().await;
+            cache.retain(|_, cached| cached.expires_at > now);
+            cache.insert(
+                cache_key,
+                CachedIdentity {
+                    identity: identity.clone(),
+                    expires_at,
+                },
+            );
+        }
+
+        Ok(identity)
+    }
+
+    async fn identity_from_userinfo_response(&self, body: &str) -> Result<Identity, Status> {
+        let trimmed = body.trim();
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(serde_json::Value::String(jwt)) => self.validate_jwt(&jwt).await,
+            Ok(value @ serde_json::Value::Object(_)) => {
+                let claims = serde_json::from_value::<OidcClaims>(value).map_err(|error| {
+                    debug!(%error, "OIDC UserInfo JSON did not contain valid identity claims");
+                    Status::unauthenticated("invalid token")
+                })?;
+                Ok(self.identity_from_claims(claims))
+            }
+            Ok(_) => {
+                debug!("OIDC UserInfo response was not a JWT or JSON object");
+                Err(Status::unauthenticated("invalid token"))
+            }
+            Err(_) if trimmed.split('.').count() == 3 => self.validate_jwt(trimmed).await,
+            Err(error) => {
+                debug!(%error, "OIDC UserInfo response was malformed");
+                Err(Status::unauthenticated("invalid token"))
+            }
+        }
     }
 }
 
-/// Authenticator that validates `Authorization: Bearer <jwt>` headers against
-/// the configured OIDC issuer.
+fn token_cache_key(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// Authenticator that validates `Authorization: Bearer <access_token>` headers
+/// against the configured OIDC issuer.
 ///
 /// Returns `Ok(None)` when no Bearer header is present, so the chain can fall
 /// through to other authenticators (e.g. the gateway-minted sandbox JWT
@@ -380,7 +514,7 @@ impl Authenticator for OidcAuthenticator {
             return Ok(None);
         };
 
-        let identity = self.cache.validate_token(token).await?;
+        let identity = self.cache.validate_access_token(token).await?;
         Ok(Some(Principal::User(UserPrincipal { identity })))
     }
 }
@@ -388,6 +522,47 @@ impl Authenticator for OidcAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn userinfo_config(issuer: String) -> OidcConfig {
+        OidcConfig {
+            issuer,
+            audience: "openshell-client".to_string(),
+            token_validation: OidcTokenValidation::Userinfo,
+            jwks_ttl_secs: 3600,
+            userinfo_cache_ttl_secs: 30,
+            roles_claim: String::new(),
+            admin_role: String::new(),
+            user_role: String::new(),
+            scopes_claim: String::new(),
+        }
+    }
+
+    async fn mount_discovery(mock_server: &MockServer, include_userinfo: bool) {
+        let mut discovery = serde_json::json!({
+            "issuer": mock_server.uri(),
+            "jwks_uri": format!("{}/jwks", mock_server.uri()),
+        });
+        if include_userinfo {
+            discovery["userinfo_endpoint"] =
+                serde_json::Value::String(format!("{}/userinfo", mock_server.uri()));
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(discovery))
+            .mount(mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [] })),
+            )
+            .mount(mock_server)
+            .await;
+    }
 
     #[test]
     fn health_is_unauthenticated() {
@@ -509,5 +684,110 @@ mod tests {
         let claims: OidcClaims = serde_json::from_value(json).unwrap();
         let scopes = claims.extract_scopes("scope");
         assert!(scopes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn userinfo_validates_and_caches_opaque_access_token() {
+        let mock_server = MockServer::start().await;
+        mount_discovery(&mock_server, true).await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .and(header("authorization", "Bearer opaque-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sub": "user-123",
+                "preferred_username": "fran"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let cache = JwksCache::new(&userinfo_config(mock_server.uri()))
+            .await
+            .expect("UserInfo cache should initialize");
+
+        let first = cache
+            .validate_access_token("opaque-token")
+            .await
+            .expect("opaque token should validate");
+        let second = cache
+            .validate_access_token("opaque-token")
+            .await
+            .expect("cached opaque token should validate");
+
+        assert_eq!(first.subject, "user-123");
+        assert_eq!(first.display_name.as_deref(), Some("fran"));
+        assert_eq!(second.subject, first.subject);
+        assert_eq!(first.provider, IdentityProvider::Oidc);
+    }
+
+    #[tokio::test]
+    async fn userinfo_rejection_is_unauthenticated() {
+        let mock_server = MockServer::start().await;
+        mount_discovery(&mock_server, true).await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .and(header("authorization", "Bearer rejected-token"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let cache = JwksCache::new(&userinfo_config(mock_server.uri()))
+            .await
+            .expect("UserInfo cache should initialize");
+        let status = cache
+            .validate_access_token("rejected-token")
+            .await
+            .expect_err("rejected token must fail");
+
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn userinfo_redirect_is_not_followed() {
+        let mock_server = MockServer::start().await;
+        mount_discovery(&mock_server, true).await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .and(header("authorization", "Bearer redirected-token"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/redirected", mock_server.uri())),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redirected"))
+            .and(header("authorization", "Bearer redirected-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sub": "user-123"
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let cache = JwksCache::new(&userinfo_config(mock_server.uri()))
+            .await
+            .expect("UserInfo cache should initialize");
+        let status = cache
+            .validate_access_token("redirected-token")
+            .await
+            .expect_err("redirected UserInfo response must fail");
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn userinfo_mode_requires_discovered_endpoint() {
+        let mock_server = MockServer::start().await;
+        mount_discovery(&mock_server, false).await;
+
+        let error = JwksCache::new(&userinfo_config(mock_server.uri()))
+            .await
+            .expect_err("missing UserInfo endpoint must fail startup");
+
+        assert!(error.contains("userinfo_endpoint"));
     }
 }
