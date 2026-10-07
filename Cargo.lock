@@ -4418,6 +4418,7 @@ dependencies = [
 name = "openshell-driver-kubernetes"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "clap",
  "futures",
@@ -4440,9 +4441,12 @@ dependencies = [
  "prost-types",
  "rand 0.9.4",
  "rcgen",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "temp-env",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
@@ -4451,6 +4455,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]

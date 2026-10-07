@@ -80,12 +80,15 @@ pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 pub struct KubernetesSandboxRuntimeConfig {
     /// TCP port exposed by the workload boundary to its paired control pod.
     pub boundary_port: u16,
+    /// Opt-in external issuance for runtime TLS. Local issuance remains the default.
+    pub cert_manager: Option<RuntimeCertificateConfig>,
 }
 
 impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
+            cert_manager: None,
         }
     }
 }
@@ -95,7 +98,80 @@ impl KubernetesSandboxRuntimeConfig {
         if self.boundary_port < 1024 {
             return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
         }
+        if let Some(config) = &self.cert_manager {
+            config.validate()?;
+        }
         Ok(())
+    }
+}
+
+/// Operator-selected cert-manager signer; no CA vendor is embedded in the driver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCertificateIssuerRef {
+    pub name: String,
+    pub kind: String,
+    pub group: String,
+}
+
+/// Initial issuance only. The operator must bound the session lifetime below
+/// the certificate lifetime; immutable bootstrap material is not hot-reloaded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCertificateConfig {
+    pub namespace: String,
+    pub issuer_ref: RuntimeCertificateIssuerRef,
+    pub trust_bundle_path: String,
+    pub duration_seconds: u64,
+    pub minimum_validity_seconds: u64,
+    pub timeout_seconds: u64,
+}
+
+impl RuntimeCertificateConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_dns_1123_label(&self.namespace)
+            || self.issuer_ref.name.is_empty()
+            || self.issuer_ref.kind.is_empty()
+            || self.issuer_ref.group.is_empty()
+            || !Path::new(&self.trust_bundle_path).is_absolute()
+        {
+            return Err("sandbox_runtime.cert_manager requires a namespace, issuer reference, and absolute trust_bundle_path".to_string());
+        }
+        if !(60..=86_400).contains(&self.duration_seconds)
+            || !(60..=self.duration_seconds).contains(&self.minimum_validity_seconds)
+            || !(1..=300).contains(&self.timeout_seconds)
+        {
+            return Err("sandbox_runtime.cert_manager requires duration 60..86400 seconds, minimum validity 60..duration, and timeout 1..300 seconds".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod runtime_certificate_config_tests {
+    use super::KubernetesSandboxRuntimeConfig;
+
+    #[test]
+    fn accepts_an_explicit_external_runtime_issuer() {
+        let parsed = toml::from_str::<KubernetesSandboxRuntimeConfig>(
+            r#"
+            [cert_manager]
+            namespace = "gateway-system"
+            trust_bundle_path = "/etc/runtime-ca/ca.crt"
+            duration_seconds = 7200
+            minimum_validity_seconds = 1200
+            timeout_seconds = 90
+            [cert_manager.issuer_ref]
+            name = "runtime"
+            kind = "Issuer"
+            group = "example.com"
+            "#,
+        );
+        assert!(
+            parsed.is_ok(),
+            "external issuance must be configurable: {parsed:?}"
+        );
+        parsed.unwrap().validate().unwrap();
     }
 }
 

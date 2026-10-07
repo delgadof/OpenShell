@@ -65,7 +65,6 @@ use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
     GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
-    generate_sandbox_tls_material,
 };
 use rand::RngCore as _;
 use serde::Deserialize;
@@ -2555,8 +2554,13 @@ impl KubernetesComputeDriver {
         child_env.retain(|name, _| !name.starts_with("OPENSHELL_"));
         let host_gateway_ip = self.config.host_gateway_ip.parse().ok();
         let session_id = launch_authentication.supervisor.session_id;
-        let tls = generate_sandbox_tls_material(session_id)
-            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+        let tls = crate::runtime_tls::provision_runtime_tls(
+            self.client.clone(),
+            &self.config.sandbox_runtime,
+            session_id,
+        )
+        .await
+        .map_err(KubernetesDriverError::Message)?;
         let verification_keys =
             gateway_verification_keys(&launch_authentication.verification_keys)?;
         let proxy_ca = generate_proxy_ca_material().map_err(KubernetesDriverError::Message)?;
@@ -2812,8 +2816,13 @@ impl KubernetesComputeDriver {
         .await?;
 
         let session_id = launch_authentication.supervisor.session_id;
-        let tls = generate_sandbox_tls_material(session_id)
-            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+        let tls = crate::runtime_tls::provision_runtime_tls(
+            self.client.clone(),
+            &self.config.sandbox_runtime,
+            session_id,
+        )
+        .await
+        .map_err(KubernetesDriverError::Message)?;
         let verification_keys =
             gateway_verification_keys(&launch_authentication.verification_keys)?;
         let proxy_ca = generate_proxy_ca_material().map_err(KubernetesDriverError::Message)?;

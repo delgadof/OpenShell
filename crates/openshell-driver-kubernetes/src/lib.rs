@@ -8,6 +8,7 @@ pub mod isolation;
 mod lifecycle;
 pub mod otel_tracing;
 mod resource_admission;
+mod runtime_tls;
 mod sandbox_runtime;
 
 pub use config::{

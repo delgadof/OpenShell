@@ -882,6 +882,48 @@ releasing a sandbox Pod. Your cluster CNI must enforce ingress and egress
 `NetworkPolicy` in every sandbox namespace; the Kubernetes API does not verify
 enforcement.
 
+#### Experimental runtime certificates through cert-manager
+
+This experimental integration supports initial certificate issuance in the
+embedded Kubernetes driver.
+The default remains per-session local issuance. To select an external signer,
+add the following to the gateway TOML (the released Helm chart does not render
+these experimental fields):
+
+```toml
+[openshell.drivers.kubernetes.sandbox_runtime.cert_manager]
+namespace = "openshell"
+trust_bundle_path = "/etc/runtime-ca/ca.crt"
+duration_seconds = 7200
+minimum_validity_seconds = 1200
+timeout_seconds = 90
+
+[openshell.drivers.kubernetes.sandbox_runtime.cert_manager.issuer_ref]
+name = "runtime"
+kind = "Issuer"
+group = "cert-manager.io"
+```
+
+The gateway generates a P-256 key and creates a `cert-manager.io/v1`
+`CertificateRequest` containing its public CSR. Any compatible issuer can be
+selected through `issuer_ref`; CA credentials stay with the issuer controller.
+The gateway ServiceAccount needs `create`, `get`, and `delete` on
+`certificaterequests` in the configured namespace. Approval is a separate
+operator-controlled policy; the gateway does not approve its own requests.
+
+The certificate must have exactly the requested session DNS SAN, only
+`serverAuth` EKU, the matching public key, and a chain valid under the explicitly
+mounted trust bundle both now and after `minimum_validity_seconds`. Issuance
+failure prevents runtime startup and never selects a local fallback. Requests
+are removed after consumption or failure; a gateway crash can leave public
+requests labeled `openshell.ai/runtime-session` for operator cleanup.
+
+This integration does not renew certificates in a running sandbox. Bootstrap
+Secrets are immutable. Bound each test session below its actual certificate
+lifetime and remove it after the test. This setting does not change inspection
+certificates, gateway TLS, supervisor JWT authorization, or standalone driver CLI
+configuration.
+
 In managed workspace mode, the Kubernetes driver copies each explicitly named
 `image_pull_secrets` Secret from `namespace` into the managed workspace
 namespace on sandbox creation. Shared and operator modes require the Secret to

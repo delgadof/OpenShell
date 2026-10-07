@@ -159,6 +159,33 @@ mount attaches an existing PVC under `/sandbox`, which skips the default PVC.
 
 ## Credentials, TLS, and Relay
 
+The embedded driver can optionally request runtime TLS certificates through
+cert-manager using `sandbox_runtime.cert_manager`. Both creation and runtime
+replacement generate the private key locally and submit a public CSR for the
+exact runtime-session DNS identity. The driver waits for approval and issuance,
+then validates the returned certificate against operator-provided CA trust.
+Issuance failures prevent startup; the configured path never falls back to a
+local signer. Without this configuration, local issuance remains the default.
+
+This experimental integration uses the existing immutable bootstrap Secrets.
+It supports initial issuance only, so operators must bound sessions below the
+actual certificate lifetime. Supervisor JWT authorization and inspection CA
+generation are unchanged. See the [runtime certificate configuration](../../docs/how-it-works/gateways/configuration.mdx#experimental-runtime-certificates-through-cert-manager)
+for issuer selection, permissions, approval, and cleanup requirements.
+
+The ignored `live_runtime_certificate_issuance` test exercises a real issuer and
+checks that its public CertificateRequest is removed. Set `KUBECONFIG` and
+`OPENSHELL_RUNTIME_CERT_MANAGER_TEST_CONTEXT` to a test cluster, and set
+`OPENSHELL_RUNTIME_CERT_MANAGER_TEST_CONFIG` to a JSON file matching
+`KubernetesSandboxRuntimeConfig`, with a `cert_manager` object containing the
+fields in the configuration example. The test also needs permission to list
+CertificateRequests in that namespace. It prints only public certificate
+metadata.
+
+```shell
+cargo test -p openshell-driver-kubernetes --lib live_runtime_certificate_issuance -- --ignored --nocapture
+```
+
 Both Pods set `automountServiceAccountToken: false`. The supervisor receives an
 explicit audience-bound projected token for the one-shot `IssueSandboxToken`
 exchange. The driver verifies that token and returns an opaque runtime identity

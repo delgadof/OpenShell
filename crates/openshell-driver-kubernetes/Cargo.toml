@@ -41,6 +41,10 @@ miette = { workspace = true }
 notify = "8"
 rand = { workspace = true }
 rcgen = { workspace = true }
+base64 = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser = "0.16"
 
 [dev-dependencies]
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
@@ -49,6 +53,7 @@ bytes = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 temp-env = "0.3"
+tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 tower = { workspace = true }
