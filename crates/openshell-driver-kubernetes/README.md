@@ -173,8 +173,10 @@ actual certificate lifetime. Supervisor JWT authorization and inspection CA
 generation are unchanged. See the [runtime certificate configuration](../../docs/how-it-works/gateways/configuration.mdx#experimental-runtime-certificates-through-cert-manager)
 for issuer selection, permissions, approval, and cleanup requirements.
 
-The ignored `live_runtime_certificate_issuance` test exercises a real issuer and
-checks that its public CertificateRequest is removed. Set `KUBECONFIG` and
+The ignored `live_runtime_certificate_issuance` test exercises a real issuer,
+completes a TLS handshake with the issued material, and checks that its public
+CertificateRequest is removed. This does not replace full sandbox create/restart
+E2E coverage. Set `KUBECONFIG` and
 `OPENSHELL_RUNTIME_CERT_MANAGER_TEST_CONTEXT` to a test cluster, and set
 `OPENSHELL_RUNTIME_CERT_MANAGER_TEST_CONFIG` to a JSON file matching
 `KubernetesSandboxRuntimeConfig`, with a `cert_manager` object containing the

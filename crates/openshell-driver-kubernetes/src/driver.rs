@@ -4162,10 +4162,21 @@ impl KubernetesComputeDriver {
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
     ) {
+        // External issuance happens before the pods are released. Preserve the
+        // existing startup grace after allowing for issuance and request cleanup.
+        let issuance_budget =
+            self.config
+                .sandbox_runtime
+                .cert_manager
+                .as_ref()
+                .map_or(Duration::ZERO, |config| {
+                    Duration::from_secs(config.timeout_seconds)
+                        .saturating_add(crate::runtime_tls::REQUEST_CLEANUP_TIMEOUT)
+                });
         if !sandbox_runtime_bootstrap_is_stale(
             object,
             SystemTime::now(),
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
+            SANDBOX_RUNTIME_BOOTSTRAP_GRACE.saturating_add(issuance_budget),
         ) {
             return;
         }
@@ -8434,6 +8445,60 @@ mod tests {
             .unwrap()
             .remove(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING);
         assert!(!sandbox_runtime_bootstrap_in_progress(&object));
+    }
+
+    #[tokio::test]
+    async fn external_issuance_preserves_startup_grace_but_still_reaps_abandoned_bootstraps() {
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = deleted.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let observed = observed.clone();
+            async move {
+                assert_eq!(request.method(), http::Method::DELETE);
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Success"}),
+                ))
+            }
+        });
+        let mut config = KubernetesComputeConfig::default();
+        config.sandbox_runtime.cert_manager = Some(serde_json::from_value(serde_json::json!({
+            "namespace":"openshell", "issuer_ref":{"name":"runtime", "kind":"Issuer", "group":"example.com"},
+            "trust_bundle_path":"/etc/runtime-ca/ca.crt", "duration_seconds":7200,
+            "minimum_validity_seconds":1200, "timeout_seconds":300
+        })).unwrap());
+        let mut driver = KubernetesComputeDriver::new_for_test(config);
+        driver.client = Client::new(service, "openshell");
+        let api = KubernetesComputeDriver::agent_sandbox_api(
+            driver.client.clone(),
+            SANDBOX_VERSION_V1BETA1,
+            "openshell",
+        );
+        let now = openshell_core::time::now_ms();
+        let mut object: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion":"agents.x-k8s.io/v1beta1", "kind":"Sandbox",
+            "metadata":{"name":"sandbox-a", "namespace":"openshell", "uid":"sandbox-uid", "resourceVersion":"1",
+                "annotations":{
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING:"true",
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT:(now - 360_000).to_string(),
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION:"create"
+                }
+            }
+        })).unwrap();
+        // Five minutes of issuance must not leave only seconds for pod startup.
+        driver
+            .reap_stale_sandbox_runtime_bootstrap(&api, &object)
+            .await;
+        assert!(!deleted.load(std::sync::atomic::Ordering::SeqCst));
+        object.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT.to_string(),
+            (now - 660_000).to_string(),
+        );
+        driver
+            .reap_stale_sandbox_runtime_bootstrap(&api, &object)
+            .await;
+        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

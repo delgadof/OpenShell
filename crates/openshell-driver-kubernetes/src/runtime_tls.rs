@@ -6,7 +6,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use kube::{
     Api, Client, ResourceExt,
-    api::{ApiResource, DeleteParams, PostParams},
+    api::{ApiResource, DeleteParams, PostParams, Preconditions},
     core::{DynamicObject, GroupVersionKind},
 };
 use openshell_core::SandboxSessionId;
@@ -30,6 +30,7 @@ use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 use crate::config::{KubernetesSandboxRuntimeConfig, RuntimeCertificateConfig};
 
 const MAX_PEM_BYTES: usize = 64 * 1024;
+pub const REQUEST_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Preserve local issuance unless the operator explicitly configures cert-manager.
 /// External issuance errors never fall back to a locally generated certificate.
@@ -42,10 +43,7 @@ pub async fn provision_runtime_tls(
         return generate_sandbox_tls_material(session_id).map_err(|error| error.to_string());
     };
     config.validate()?;
-    let trust = tokio::fs::read_to_string(&config.trust_bundle_path)
-        .await
-        .map_err(|_| "cannot read configured runtime CA trust bundle".to_string())?;
-    certificate_pem(&trust)?;
+    let trust = read_trust_bundle(&config.trust_bundle_path).await?;
     let name = format!("sandbox.{session_id}.openshell.internal");
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|error| format!("generate runtime key: {error}"))?;
@@ -56,17 +54,27 @@ pub async fn provision_runtime_tls(
         "CertificateRequest",
     ));
     let api: Api<DynamicObject> = Api::namespaced_with(client, &config.namespace, &resource);
-    // Name is allocated locally so cleanup is possible even when POST times out.
+    // Keep the CSR and name for recovering ownership if POST's response is lost.
     let request_name = request.name_any();
+    let mut request_uid = None;
     let result = tokio::time::timeout(Duration::from_secs(config.timeout_seconds), async {
-        api.create(&PostParams::default(), &request)
+        let created = api
+            .create(&PostParams::default(), &request)
             .await
-            .map_err(|error| format!("create runtime CertificateRequest: {error}"))?;
+            .map_err(|error| api_error("create", &error))?;
+        request_uid = Some(owned_request_uid(&created, &request)?);
         loop {
-            let current = api
-                .get(&request_name)
-                .await
-                .map_err(|error| format!("read runtime CertificateRequest: {error}"))?;
+            let current = match api.get(&request_name).await {
+                Ok(current) => current,
+                Err(error) if retryable_api_error(&error) => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(error) => return Err(api_error("read", &error)),
+            };
+            if Some(owned_request_uid(&current, &request)?) != request_uid {
+                return Err("runtime CertificateRequest was replaced during issuance".to_string());
+            }
             if let Some(certificate) = issued_certificate(&current.data["status"])? {
                 validate_issued_certificate(
                     &certificate,
@@ -90,20 +98,112 @@ pub async fn provision_runtime_tls(
     .await
     .map_err(|_| "runtime certificate issuance timed out".to_string())
     .and_then(|result| result);
-    // Requests contain only public material. Best-effort removal on all exits;
-    // issuance audit remains at the CA. A process crash may leave a labeled CR.
+    // Requests contain only public material. Cancellation or a process crash
+    // can leave a labeled request; cleanup failures must not mask issuance errors.
     match tokio::time::timeout(
-        Duration::from_secs(10),
-        api.delete(&request_name, &DeleteParams::default()),
+        REQUEST_CLEANUP_TIMEOUT,
+        remove_request(&api, &request, request_uid),
     )
     .await
     {
-        Ok(Ok(_) | Err(kube::Error::Api(kube::error::ErrorResponse { code: 404, .. }))) => {}
+        Ok(Ok(())) => {}
         _ => {
             tracing::warn!(certificate_request = %request_name, "runtime CertificateRequest cleanup failed");
         }
     }
     result
+}
+
+async fn read_trust_bundle(path: &str) -> Result<String, String> {
+    let path = path.to_string();
+    // Reuse the shared regular-file reader: it rejects devices/FIFOs and bounds
+    // allocation to 1 MiB. Apply the smaller runtime bundle limit below.
+    let pem = tokio::task::spawn_blocking(move || {
+        openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+            &path,
+            "sandbox_runtime.cert_manager.trust_bundle_path",
+        )
+    })
+    .await
+    .map_err(|_| "runtime trust bundle read task failed".to_string())??;
+    let mut roots = RootCertStore::empty();
+    for certificate in certificate_pem(&pem)? {
+        roots
+            .add(certificate)
+            .map_err(|_| "invalid runtime trust anchor".to_string())?;
+    }
+    Ok(pem)
+}
+
+/// cert-manager adds requester identity fields to spec. Compare every field we
+/// submitted, while allowing those server-owned additions.
+fn owned_request_uid(current: &DynamicObject, expected: &DynamicObject) -> Result<String, String> {
+    let same_spec = expected.data["spec"].as_object().is_some_and(|spec| {
+        spec.iter().all(|(key, value)| {
+            // Go's optional bool serialization may omit isCA=false.
+            (key == "isCA" && value == false && current.data["spec"].get(key).is_none())
+                || current.data["spec"].get(key) == Some(value)
+        })
+    });
+    if current.metadata.name != expected.metadata.name
+        || current.metadata.namespace != expected.metadata.namespace
+        || current.metadata.deletion_timestamp.is_some()
+        || !same_spec
+    {
+        return Err("runtime CertificateRequest identity or spec changed".to_string());
+    }
+    current
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| "runtime CertificateRequest has no UID".to_string())
+}
+
+async fn remove_request(
+    api: &Api<DynamicObject>,
+    expected: &DynamicObject,
+    uid: Option<String>,
+) -> Result<(), kube::Error> {
+    let name = expected.name_any();
+    let uid = if let Some(uid) = uid {
+        uid
+    } else {
+        let Some(current) = api.get_opt(&name).await? else {
+            return Ok(());
+        };
+        let Ok(uid) = owned_request_uid(&current, expected) else {
+            // A rejected create must never delete someone else's request.
+            return Ok(());
+        };
+        uid
+    };
+    let params = DeleteParams::default().preconditions(Preconditions {
+        uid: Some(uid),
+        resource_version: None,
+    });
+    match api.delete(&name, &params).await {
+        Ok(_) | Err(kube::Error::Api(kube::error::ErrorResponse { code: 404, .. })) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn retryable_api_error(error: &kube::Error) -> bool {
+    match error {
+        kube::Error::Api(response) => response.code == 429 || response.code >= 500,
+        kube::Error::Service(_) | kube::Error::HyperError(_) => true,
+        _ => false,
+    }
+}
+
+fn api_error(operation: &str, error: &kube::Error) -> String {
+    // Admission responses may contain operator credentials or the CSR. Retain
+    // the operation and HTTP status, never the untrusted response body.
+    match error {
+        kube::Error::Api(response) => format!(
+            "{operation} runtime CertificateRequest: Kubernetes API returned HTTP {}",
+            response.code
+        ),
+        _ => format!("{operation} runtime CertificateRequest: Kubernetes API request failed"),
+    }
 }
 
 fn certificate_request(
@@ -121,17 +221,44 @@ fn certificate_request(
         .serialize_request(key)
         .and_then(|request| request.pem())
         .map_err(|error| format!("build runtime CSR: {error}"))?;
+    // Emit Go's canonical whole-second duration form so a typed API client
+    // round trip cannot change the spec merely by normalizing its spelling.
+    let seconds = config.duration_seconds;
+    let duration = if seconds >= 3600 {
+        format!(
+            "{}h{}m{}s",
+            seconds / 3600,
+            seconds % 3600 / 60,
+            seconds % 60
+        )
+    } else {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    };
     // A fresh suffix permits retries of one durable session without reusing keys.
     serde_json::from_value(json!({
-        "apiVersion":"cert-manager.io/v1", "kind":"CertificateRequest",
-        "metadata":{"name":format!("runtime-{}", SandboxSessionId::new()),
-            "namespace":config.namespace,
-            "labels":{"openshell.ai/runtime-session":session_id.to_string(), "app.kubernetes.io/managed-by":"openshell"}},
-        "spec":{"request":STANDARD.encode(csr), "isCA":false,
-            "duration":format!("{}s", config.duration_seconds),
-            "usages":["digital signature", "server auth"],
-            "issuerRef":{"name":config.issuer_ref.name,"kind":config.issuer_ref.kind,"group":config.issuer_ref.group}}
-    })).map_err(|error| format!("build runtime CertificateRequest: {error}"))
+        "apiVersion": "cert-manager.io/v1",
+        "kind": "CertificateRequest",
+        "metadata": {
+            "name": format!("runtime-{}", SandboxSessionId::new()),
+            "namespace": config.namespace,
+            "labels": {
+                "openshell.ai/runtime-session": session_id.to_string(),
+                "app.kubernetes.io/managed-by": "openshell"
+            }
+        },
+        "spec": {
+            "request": STANDARD.encode(csr),
+            "isCA": false,
+            "duration": duration,
+            "usages": ["digital signature", "server auth"],
+            "issuerRef": {
+                "name": config.issuer_ref.name,
+                "kind": config.issuer_ref.kind,
+                "group": config.issuer_ref.group
+            }
+        }
+    }))
+    .map_err(|error| format!("build runtime CertificateRequest: {error}"))
 }
 
 fn issued_certificate(status: &Value) -> Result<Option<String>, String> {
@@ -178,15 +305,43 @@ fn certificate_pem(pem: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'s
         return Err("certificate PEM is empty or too large".to_string());
     }
     let mut certificates = Vec::new();
-    for item in rustls_pemfile::read_all(&mut Cursor::new(pem)) {
-        match item.map_err(|_| "invalid certificate PEM".to_string())? {
-            rustls_pemfile::Item::X509Certificate(certificate) => certificates.push(certificate),
+    let mut remaining = pem.trim();
+    while !remaining.is_empty() {
+        // CA exports can prefix certificates with public descriptive metadata.
+        // Do not let a metadata line hide another kind of PEM boundary.
+        if let Some((line, rest)) = remaining.split_once('\n')
+            && (line.starts_with("Subject:") || line.starts_with("Issuer:"))
+            && !line.contains("-----")
+        {
+            remaining = rest.trim_start();
+            continue;
+        }
+        if !remaining.starts_with("-----BEGIN CERTIFICATE-----") {
+            return Err("certificate bundle must contain only PEM certificates".to_string());
+        }
+        let end = remaining
+            .find("-----END CERTIFICATE-----")
+            .ok_or_else(|| "unterminated certificate PEM".to_string())?
+            + "-----END CERTIFICATE-----".len();
+        let item = rustls_pemfile::read_one(&mut Cursor::new(&remaining[..end]))
+            .map_err(|_| "invalid certificate PEM".to_string())?
+            .ok_or_else(|| "empty certificate PEM block".to_string())?;
+        match item {
+            rustls_pemfile::Item::X509Certificate(certificate) => {
+                let (trailing, _) = parse_x509_certificate(&certificate)
+                    .map_err(|_| "invalid certificate DER".to_string())?;
+                if !trailing.is_empty() {
+                    return Err("unexpected data after certificate DER".to_string());
+                }
+                certificates.push(certificate);
+            }
             _ => {
                 return Err(
                     "certificate bundle must contain only certificates, never keys".to_string(),
                 );
             }
         }
+        remaining = remaining[end..].trim_start();
     }
     if certificates.is_empty() || certificates.len() > 16 {
         return Err("certificate bundle has invalid certificate count".to_string());
@@ -282,7 +437,62 @@ mod tests {
     use http_body_util::BodyExt as _;
     use rcgen::{BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa};
     use serde_json::json;
-    use std::{convert::Infallible, io::Write as _, sync::Mutex};
+    use std::{
+        convert::Infallible,
+        io::{Read as _, Write as _},
+        sync::Mutex,
+    };
+
+    fn assert_tls_handshake(material: &SandboxTlsMaterial) {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let key = KeyPair::from_pem(&material.private_key_pem).unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                certificate_pem(&material.certificate_chain_pem).unwrap(),
+                PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        for root in certificate_pem(&material.trust_anchor_pem).unwrap() {
+            roots.add(root).unwrap();
+        }
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client),
+            ServerName::try_from(material.server_name.clone()).unwrap(),
+        )
+        .unwrap();
+        for _ in 0..16 {
+            let mut data = Vec::new();
+            client.write_tls(&mut data).unwrap();
+            server.read_tls(&mut Cursor::new(data)).unwrap();
+            server.process_new_packets().unwrap();
+            let mut data = Vec::new();
+            server.write_tls(&mut data).unwrap();
+            client.read_tls(&mut Cursor::new(data)).unwrap();
+            client.process_new_packets().unwrap();
+            if !client.is_handshaking() && !server.is_handshaking() {
+                client.writer().write_all(b"runtime TLS").unwrap();
+                let mut data = Vec::new();
+                client.write_tls(&mut data).unwrap();
+                server.read_tls(&mut Cursor::new(data)).unwrap();
+                server.process_new_packets().unwrap();
+                let mut received = [0; 11];
+                server.reader().read_exact(&mut received).unwrap();
+                assert_eq!(&received, b"runtime TLS");
+                return;
+            }
+        }
+        panic!("issued material did not complete a TLS handshake");
+    }
 
     /// Creates and removes a real `CertificateRequest` using an operator-configured
     /// cluster and issuer. Configuration contains public trust and issuer names;
@@ -313,10 +523,11 @@ mod tests {
         let material = provision_runtime_tls(client.clone(), &runtime, session)
             .await
             .expect("live issuance and certificate validation");
+        assert_tls_handshake(&material);
         let certificates = certificate_pem(&material.certificate_chain_pem).unwrap();
         let (_, leaf) = parse_x509_certificate(&certificates[0]).unwrap();
         println!(
-            "Runtime certificate verified: issuer={}, serial={}, DNS={}",
+            "Runtime certificate and TLS handshake verified: issuer={}, serial={}, DNS={}",
             leaf.issuer(),
             leaf.raw_serial_as_string(),
             material.server_name
@@ -341,9 +552,16 @@ mod tests {
     }
 
     async fn exercise_issuer(outcome: &str) -> (Result<SandboxTlsMaterial, String>, Vec<String>) {
+        let timeout_seconds = if outcome == "pending" { 1 } else { 5 };
         let (ca, ca_key) = ca();
         let mut trust = tempfile::NamedTempFile::new().unwrap();
-        trust.write_all(ca.pem().as_bytes()).unwrap();
+        if outcome == "invalid-trust" {
+            trust
+                .write_all(b"-----BEGIN CERTIFICATE-----\nYmFk\n-----END CERTIFICATE-----\n")
+                .unwrap();
+        } else {
+            trust.write_all(ca.pem().as_bytes()).unwrap();
+        }
         let session = SandboxSessionId::new();
         let expected_name = format!("sandbox.{session}.openshell.internal");
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -363,6 +581,10 @@ mod tests {
             );
             async move {
                 let method = request.method().to_string();
+                assert_ne!(
+                    outcome, "invalid-trust",
+                    "invalid trust must fail before API access"
+                );
                 assert!(request.uri().path().starts_with(
                     "/apis/cert-manager.io/v1/namespaces/gateway-system/certificaterequests"
                 ));
@@ -372,12 +594,19 @@ mod tests {
                     "POST" => {
                         let bytes = request.into_body().collect().await.unwrap().to_bytes();
                         let mut submitted: Value = serde_json::from_slice(&bytes).unwrap();
+                        submitted["metadata"]["uid"] = json!("created-request-uid");
                         assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE KEY"));
                         assert_eq!(
                             submitted["spec"]["issuerRef"],
                             json!({"name":"runtime","kind":"Issuer","group":"example.com"})
                         );
                         assert_eq!(submitted["spec"]["isCA"], false);
+                        // Typed cert-manager API clients normalize Go durations
+                        // and may omit optional false booleans when serializing.
+                        if outcome == "normalized-spec" {
+                            submitted["spec"]["duration"] = json!("2h0m0s");
+                            submitted["spec"].as_object_mut().unwrap().remove("isCA");
+                        }
                         assert_eq!(
                             submitted["spec"]["usages"],
                             json!(["digital signature", "server auth"])
@@ -395,7 +624,8 @@ mod tests {
                         );
                         let signed = csr.signed_by(&ca, &ca_key).unwrap();
                         submitted["status"] = match outcome.as_str() {
-                            "ready" => {
+                            "ready" | "replaced" | "changed-spec" | "retry-get"
+                            | "normalized-spec" => {
                                 json!({"conditions":[{"type":"Approved","status":"True"},{"type":"Ready","status":"True"}], "certificate":STANDARD.encode(signed.pem())})
                             }
                             "denied" => json!({"conditions":[{"type":"Denied","status":"True"}]}),
@@ -403,17 +633,46 @@ mod tests {
                                 json!({"conditions":[{"type":"Ready","status":"False","reason":"Pending"}]})
                             }
                         };
-                        *returned.lock().unwrap() = submitted.clone();
+                        let mut stored = submitted.clone();
+                        if outcome == "replaced" {
+                            stored["metadata"]["uid"] = json!("different-request-uid");
+                        }
+                        if outcome == "changed-spec" || outcome == "conflict" {
+                            stored["spec"]["request"] = json!("unrelated-csr");
+                        }
+                        *returned.lock().unwrap() = stored;
                         if outcome == "unavailable" {
                             code = 503;
                             json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"ServiceUnavailable","code":503,"message":"test unavailable"})
+                        } else if outcome == "conflict" {
+                            code = 409;
+                            json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"AlreadyExists","code":409,"message":"sensitive admission detail"})
                         } else {
                             code = 201;
                             submitted
                         }
                     }
-                    "GET" => returned.lock().unwrap().clone(),
+                    "GET" => {
+                        if outcome == "retry-get"
+                            && calls
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|call| *call == "GET")
+                                .count()
+                                == 1
+                        {
+                            code = 503;
+                            json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"ServiceUnavailable","code":503,"message":"temporary outage"})
+                        } else {
+                            returned.lock().unwrap().clone()
+                        }
+                    }
                     "DELETE" => {
+                        assert_ne!(outcome, "conflict", "must not delete an unrelated request");
+                        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                        let options: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(options["preconditions"]["uid"], "created-request-uid");
                         json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200})
                     }
                     _ => panic!("unexpected API method: {method}"),
@@ -438,7 +697,7 @@ mod tests {
                 trust_bundle_path: trust.path().to_str().unwrap().to_string(),
                 duration_seconds: 7200,
                 minimum_validity_seconds: 1200,
-                timeout_seconds: 1,
+                timeout_seconds,
             }),
             ..Default::default()
         };
@@ -453,6 +712,7 @@ mod tests {
         let material = result.unwrap();
         assert!(material.certificate_chain_pem.contains("BEGIN CERTIFICATE"));
         assert!(material.private_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert_tls_handshake(&material);
         assert_eq!(calls, ["POST", "GET", "DELETE"]);
     }
 
@@ -473,6 +733,91 @@ mod tests {
             "runtime certificate issuance timed out"
         );
         assert_eq!(calls.last().unwrap(), "DELETE");
+    }
+
+    #[tokio::test]
+    async fn rejects_replaced_or_modified_requests() {
+        for outcome in ["replaced", "changed-spec"] {
+            let (result, _) = exercise_issuer(outcome).await;
+            assert!(result.is_err(), "must reject {outcome}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_conflicts_never_delete_an_unrelated_request_or_expose_api_details() {
+        let (result, calls) = exercise_issuer("conflict").await;
+        let error = result.unwrap_err();
+        assert!(!error.contains("sensitive admission detail"));
+        assert!(!calls.iter().any(|method| method == "DELETE"));
+    }
+
+    #[tokio::test]
+    async fn retries_a_transient_read_failure_within_the_issuance_deadline() {
+        let (result, calls) = exercise_issuer("retry-get").await;
+        result.unwrap();
+        assert_eq!(calls, ["POST", "GET", "GET", "DELETE"]);
+    }
+
+    #[tokio::test]
+    async fn accepts_spec_normalization_by_typed_cert_manager_clients() {
+        let (result, calls) = exercise_issuer("normalized-spec").await;
+        assert_tls_handshake(&result.unwrap());
+        assert_eq!(calls, ["POST", "GET", "DELETE"]);
+    }
+
+    #[test]
+    fn accepts_public_subject_and_issuer_metadata_around_pem_certificates() {
+        let (ca, _) = ca();
+        let pem = format!("Subject: CN=Test CA\nIssuer: CN=Test CA\n{}", ca.pem());
+        assert_eq!(
+            certificate_pem(&pem).unwrap(),
+            certificate_pem(&ca.pem()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_trust_before_contacting_the_issuer() {
+        let (result, calls) = exercise_issuer("invalid-trust").await;
+        assert!(result.is_err());
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_pem_blocks_and_trailing_text() {
+        let (ca, _) = ca();
+        for extra in [
+            "-----BEGIN UNKNOWN-----\nYmFk\n-----END UNKNOWN-----\n",
+            "unexpected trailing text",
+        ] {
+            assert!(certificate_pem(&(ca.pem() + extra)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_non_regular_and_oversized_trust_files() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            read_trust_bundle(directory.path().to_str().unwrap())
+                .await
+                .is_err()
+        );
+        #[cfg(unix)]
+        assert!(
+            read_trust_bundle("/dev/zero")
+                .await
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        let (ca, _) = ca();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(ca.pem().as_bytes()).unwrap();
+        file.write_all(&vec![b' '; MAX_PEM_BYTES]).unwrap();
+        assert!(
+            read_trust_bundle(file.path().to_str().unwrap())
+                .await
+                .unwrap_err()
+                .contains("too large")
+        );
     }
 
     #[tokio::test]

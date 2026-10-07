@@ -911,12 +911,27 @@ The gateway ServiceAccount needs `create`, `get`, and `delete` on
 `certificaterequests` in the configured namespace. Approval is a separate
 operator-controlled policy; the gateway does not approve its own requests.
 
+Mount a regular PEM file containing only CA certificates (at most 64 KiB and
+16 certificates). Public `Subject:` and `Issuer:` metadata lines are accepted.
+Invalid trust is rejected before contacting the issuer.
+`duration_seconds` must be 61–86400, `minimum_validity_seconds` must be at least
+60 and strictly less than the requested duration, and `timeout_seconds` must be
+1–300. Leave enough lifetime for issuance and startup: the CA can choose a
+different duration, and OpenShell validates the certificate it actually receives.
+
 The certificate must have exactly the requested session DNS SAN, only
 `serverAuth` EKU, the matching public key, and a chain valid under the explicitly
 mounted trust bundle both now and after `minimum_validity_seconds`. Issuance
-failure prevents runtime startup and never selects a local fallback. Requests
-are removed after consumption or failure; a gateway crash can leave public
-requests labeled `openshell.ai/runtime-session` for operator cleanup.
+failure prevents runtime startup and never selects a local fallback. Temporary
+API read failures are retried within the issuance deadline. The bootstrap grace
+period includes that deadline plus up to ten seconds for request cleanup, so
+issuance does not consume the existing five-minute pod startup allowance.
+
+OpenShell checks request identity and the submitted specification on every read.
+Cleanup uses a UID precondition and only removes a request associated with the
+submitted CSR. Cleanup is best effort after consumption or failure; cancellation,
+a gateway crash, or an API outage can leave public requests labeled
+`openshell.ai/runtime-session` for operator cleanup.
 
 This integration does not renew certificates in a running sandbox. Bootstrap
 Secrets are immutable. Bound each test session below its actual certificate
